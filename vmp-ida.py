@@ -20,13 +20,13 @@ class MyDbgHook(DBG_Hooks):
 
     def dbg_process_start(self, pid, tid, ea, name, base, size):
         global end_addresses
-        print("//Process started, pid=%d tid=%d name=%s" % (pid, tid, name))
+        instructionsOutput.write("//Process started, pid=%d tid=%d name=%s\n" % (pid, tid, name))
         self.image_base = base
         vm_enter = self.image_base + 0x6BA11
         erase_all_breakpoints()
         end_addresses = get_handler_end_addresses(vm_enter)
         for addr in end_addresses:
-            print "//Added bp @ %08X" % addr
+            instructionsOutput.write("//Added bp @ %08X\n" % addr)
             idc.AddBpt(addr)
 
     def dbg_bpt(self, tid, ea):
@@ -42,28 +42,35 @@ class MyDbgHook(DBG_Hooks):
             if self.is_vm_exit:
                 self.is_vm_exit = False
                 # One start is okay since we are in a ret instruction
+
                 vm_enter = None
-                for i in range(1, 100):
-                    try:
-                        ptr = Dword(cpu.Esp + i * 4)
-                        vm_enter = try_get_vm_enter_address(ptr)
-                        if vm_enter:
-                            break
-                    except:
-                        pass
+
+                if is_cpuid_with_vm_enter(Dword(cpu.Esp)):
+                    ptr = Dword(cpu.Esp) + 2
+                    vm_enter = try_get_vm_enter_address(ptr)
+                else:
+                    for i in range(1, 100):
+                        try:
+                            ptr = Dword(cpu.Esp + i * 4)
+                            vm_enter = try_get_vm_enter_address(ptr)
+                            if vm_enter:
+                                break
+                        except:
+                            pass
 
                 if vm_enter:
-                    print "//Detected vm_enter after vm_exit"
+                    instructionsOutput.write("//Detected vm_enter after vm_exit\n")
                     erase_all_breakpoints()
                     end_addresses = get_handler_end_addresses(vm_enter)
                     for addr in end_addresses:
-                        print "//Added bp @ %08X" % addr
+                        instructionsOutput.write("//Added bp @ %08X\n" % addr)
                         idc.AddBpt(addr)
                     request_continue_process()
                     run_requests()
                     return 0
                 else:
-                    print "//Failed to detect vm_enter after vm_exit @ %08X" % eip
+                    instructionsOutput.write("//Failed to detect vm_enter after vm_exit @ %08X\n" % eip)
+                    print("[+] INFO: Program probably finished writing instructions...")
                     request_suspend_process()
                     run_requests()
                     return 0
@@ -73,18 +80,16 @@ class MyDbgHook(DBG_Hooks):
             #print "match : " + str(matches)
 
             if len(matches) == 0:
-                print "//No yara rule matched handler @ address - image_base = " + hex(edi - self.image_base)
+                instructionsOutput.write("//No yara rule matched handler @ address - image_base = " + hex(edi - self.image_base) + "\n")
                 request_suspend_process()
                 run_requests()
                 return 0
 
             insn = matches[0].rule[4:]
-            print str(getattr(sys.modules[__name__], insn)(cpu.Esi))
+            instructionsOutput.write(str(getattr(sys.modules[__name__], insn)(cpu.Esi)) + "\n")
+
             if matches[0].rule == "VMP_Exit":
                 self.is_vm_exit = True
-                request_suspend_process()
-                run_requests()
-                return 0
 
             erase_all_breakpoints()
             end_addresses = get_handler_end_addresses(edi)
@@ -104,6 +109,7 @@ try:
     if debughook:
         print("Removing previous hook ...")
         debughook.unhook()
+    instructionsOutput.close()
 except:
     pass
 
@@ -111,11 +117,12 @@ except:
 debughook = MyDbgHook()
 debughook.hook()
 debughook.steps = 0
+instructionsOutput = file("D:\\vmp-program.vmp", "w+", 0)
 
 ############################################################
 from capstone import *
 
-rules = yara.compile(filepath='vmp_rules.yar')
+rules = yara.compile(filepath='D:\\vmp_rules.yar')
 disassembler = Cs(CS_ARCH_X86, CS_MODE_32)
 
 
@@ -220,8 +227,10 @@ def get_handler_end_addresses(address):
                 end_addresses.append(i.address)
             elif (i.mnemonic == "push") and (i.op_str == "edi") and (block[n+1].mnemonic == "ret"):
                 end_addresses.append(i.address)
+                break
             elif i.mnemonic == "ret":
                 end_addresses.append(i.address)
+                break
             n += 1
 
     return end_addresses
@@ -243,7 +252,23 @@ def try_get_vm_enter_address(address):
     return None
 
 
+def is_cpuid_with_vm_enter(address):
+    global disassembler
+
+    code = GetManyBytes(address, 12)
+    disasm = list(disassembler.disasm(code, address))
+    if len(disasm) == 3:
+        if disasm[0].mnemonic == "cpuid" and disasm[1].mnemonic == "push" and disasm[2].mnemonic == "call":
+            maybe_vm_enter = int(disasm[2].op_str, 0)
+            code_bytes = get_full_handler_code(maybe_vm_enter)
+            matches = rules.match(data=code_bytes)
+            if len(matches) == 1:
+                if matches[0].rule == "VMP_Enter":
+                    return True
+    return False
+
 #Handlers
+
 
 def neg_byte(n):
     return -n & 0xFF
@@ -645,7 +670,7 @@ class SetMemSs32:
     # Data values
 
     # Semantics
-    stack_change = None
+    stack_change = 8
     size = None
 
     def __init__(self, bytecode_address):
